@@ -42,6 +42,7 @@ def setup_admin_handlers(bot):
     
     async def show_accounts_page(event, page: int = 1):
         """Show accounts list with pagination (5x2 grid)."""
+        is_callback = isinstance(event, events.CallbackQuery.Event)
         accounts = await get_accounts(active_only=False)
         total = len(accounts)
 
@@ -49,7 +50,7 @@ def setup_admin_handlers(bot):
 
         if total == 0:
             text = "No accounts stored yet."
-            if event.is_callback:
+            if is_callback:
                 await event.edit(text)
             else:
                 await event.respond(text)
@@ -85,7 +86,7 @@ def setup_admin_handlers(bot):
         if nav_buttons:
             btn_rows.append(nav_buttons)
 
-        if event.is_callback:
+        if is_callback:
             await event.edit(text, buttons=btn_rows)
         else:
             await event.respond(text, buttons=btn_rows)
@@ -100,9 +101,9 @@ def setup_admin_handlers(bot):
     async def show_main_menu(event):
         text = "🛠 Admin Panel\nChoose an action:"
         buttons = [
-            ["📂 Accounts", "📊 Stats"],
-            ["⚠️ Errors", "⏱ Scheduler"],
-            ["➕ Add Account"]
+            [Button.text("📂 Accounts"), Button.text("📊 Stats")],
+            [Button.text("⚠️ Errors"), Button.text("⏱ Scheduler")],
+            [Button.text("➕ Add Account")]
         ]
         await event.respond(text, buttons=buttons)
 
@@ -322,6 +323,7 @@ def setup_admin_handlers(bot):
         
         if mode == "add_account_phone":
             phone = text
+            _ensure_sessions_dir()
             client = TelegramClient(os.path.join(SESSIONS_DIR, f"{phone}"), API_ID, API_HASH)
             await client.connect()
             try:
