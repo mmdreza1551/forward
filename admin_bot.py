@@ -156,11 +156,28 @@ def setup_admin_handlers(bot):
         ]
         await event.respond(text, buttons=buttons)
 
+    async def cancel_flow(event, state):
+        """Cancel current flow, cleanup and return to main menu."""
+        if "client" in state:
+            try:
+                await state["client"].disconnect()
+            except:
+                pass
+        ADMIN_STATE.pop(event.sender_id, None)
+        await event.respond("❌ Operation cancelled.")
+        await show_main_menu(event)
+
     @bot.on(events.NewMessage(func=lambda e: e.text == "➕ Add Account"))
     async def msg_add_account(event):
         if event.sender_id not in ADMIN_IDS: return
         ADMIN_STATE[event.sender_id] = {"mode": "add_account_phone"}
-        await event.respond("Please enter the phone number (including country code, e.g., +989123456789):")
+        buttons = [
+            [Button.text("❌ Cancel", resize=True, single_use=False)]
+        ]
+        await event.respond(
+            "Please enter the phone number (including country code, e.g., +989123456789):",
+            buttons=buttons
+        )
 
     @bot.on(events.CallbackQuery(pattern=re.compile(br"menu:accounts:(\d+)")))
     async def cb_menu_accounts_page(event):
@@ -213,10 +230,14 @@ def setup_admin_handlers(bot):
         if event.sender_id not in ADMIN_IDS: return
         acc_id = int(event.pattern_match.group(1))
         ADMIN_STATE[event.sender_id] = {"mode": "setting_proxy", "account_id": acc_id}
+        buttons = [
+            [Button.text("❌ Cancel", resize=True, single_use=False)]
+        ]
         await event.respond(
             f"🌐 Proxy for account {acc_id}\n"
             "Format: `host:port` or `host:port:user:pass`\n"
-            "Send `none` to clear."
+            "Send `none` to clear.",
+            buttons=buttons
         )
 
     @bot.on(events.CallbackQuery(pattern=re.compile(br"accounts:delete_confirm:(\d+):(\d+)")))
@@ -277,10 +298,21 @@ def setup_admin_handlers(bot):
         buttons = [[Button.inline("▶️ Start", data=b"scheduler:start"), Button.inline("⏹ Stop", data=b"scheduler:stop")]]
         await event.edit(text, buttons=buttons)
 
+    @bot.on(events.NewMessage(func=lambda e: e.text in ["❌ Cancel", "/cancel"]))
+    async def msg_cancel(event):
+        if event.sender_id not in ADMIN_IDS: return
+        state = ADMIN_STATE.get(event.sender_id)
+        if state:
+            await cancel_flow(event, state)
+
     @bot.on(events.NewMessage)
     async def admin_message_handler(event):
         if event.sender_id not in ADMIN_IDS: return
         if not event.text: return
+        
+        # Check for cancel command
+        if event.text.strip() in ["❌ Cancel", "/cancel"]:
+            return  # Already handled by msg_cancel
         
         state = ADMIN_STATE.get(event.sender_id)
         if not state: return
@@ -300,7 +332,13 @@ def setup_admin_handlers(bot):
                     "phone_code_hash": sent_code.phone_code_hash,
                     "client": client
                 }
-                await event.respond(f"Code sent to {phone}. Please enter the code:")
+                buttons = [
+                    [Button.text("❌ Cancel", resize=True, single_use=False)]
+                ]
+                await event.respond(
+                    f"Code sent to {phone}. Please enter the code:",
+                    buttons=buttons
+                )
             except Exception as e:
                 await event.respond(f"Error: {e}")
                 await client.disconnect()
@@ -318,11 +356,21 @@ def setup_admin_handlers(bot):
                 await event.respond(f"✅ Account {phone} added successfully!")
                 await client.disconnect()
                 ADMIN_STATE.pop(event.sender_id)
+                await show_main_menu(event)
             except SessionPasswordNeededError:
                 ADMIN_STATE[event.sender_id]["mode"] = "add_account_2fa"
-                await event.respond("Two-step verification enabled. Please enter your password:")
+                buttons = [
+                    [Button.text("❌ Cancel", resize=True, single_use=False)]
+                ]
+                await event.respond(
+                    "Two-step verification enabled. Please enter your password:",
+                    buttons=buttons
+                )
             except PhoneCodeInvalidError:
-                await event.respond("Invalid code. Please try again:")
+                buttons = [
+                    [Button.text("❌ Cancel", resize=True, single_use=False)]
+                ]
+                await event.respond("Invalid code. Please try again:", buttons=buttons)
             except Exception as e:
                 await event.respond(f"Error: {e}")
                 await client.disconnect()
@@ -338,8 +386,12 @@ def setup_admin_handlers(bot):
                 await event.respond(f"✅ Account {phone} added successfully!")
                 await client.disconnect()
                 ADMIN_STATE.pop(event.sender_id)
+                await show_main_menu(event)
             except PasswordHashInvalidError:
-                await event.respond("Invalid password. Please try again:")
+                buttons = [
+                    [Button.text("❌ Cancel", resize=True, single_use=False)]
+                ]
+                await event.respond("Invalid password. Please try again:", buttons=buttons)
             except Exception as e:
                 await event.respond(f"Error: {e}")
                 await client.disconnect()
