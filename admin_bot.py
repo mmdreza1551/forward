@@ -3,12 +3,18 @@
 import os
 import re
 import logging
+import asyncio
 from typing import Dict
 
-from telethon import events, Button
-from telethon.errors.rpcerrorlist import MessageNotModifiedError
+from telethon import events, Button, TelegramClient
+from telethon.errors.rpcerrorlist import (
+    MessageNotModifiedError, 
+    SessionPasswordNeededError,
+    PhoneCodeInvalidError,
+    PasswordHashInvalidError
+)
 
-from config import ADMIN_ID, SESSIONS_DIR
+from config import ADMIN_IDS, SESSIONS_DIR, API_ID, API_HASH
 from db import (
     get_global_stats,
     get_latest_errors,
@@ -16,10 +22,11 @@ from db import (
     toggle_account_active,
     update_proxy,
     add_account,
+    get_account_by_id,
+    delete_account,
 )
 from scheduler import start_scheduler, stop_scheduler, is_scheduler_running
 
-PAGE_SIZE = 5  # number of accounts per page in Accounts menu
 logger = logging.getLogger(__name__)
 
 # Simple in-memory state for admin flows
@@ -32,158 +39,93 @@ def _ensure_sessions_dir():
 
 
 def setup_admin_handlers(bot):
+    
     async def show_accounts_page(event, page: int = 1):
-        """Show accounts list with pagination (5 accounts per page)."""
+        """Show accounts list with pagination (5x2 grid)."""
         accounts = await get_accounts(active_only=False)
         total = len(accounts)
 
+        PAGE_SIZE_GRID = 10 # 5 rows * 2 columns
+
         if total == 0:
             text = "No accounts stored yet."
-            buttons = [
-                [Button.inline("➕ Add Account", data=b"accounts:add")],
-                [Button.inline("⬅️ Back", data=b"menu:back")],
-            ]
-            await event.edit(text, buttons=buttons)
+            if event.is_callback:
+                await event.edit(text)
+            else:
+                await event.respond(text)
             return
 
-        # calc total pages
-        total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
-        if page < 1:
-            page = 1
-        if page > total_pages:
-            page = total_pages
+        total_pages = (total + PAGE_SIZE_GRID - 1) // PAGE_SIZE_GRID
+        if page < 1: page = 1
+        if page > total_pages: page = total_pages
 
-        start_idx = (page - 1) * PAGE_SIZE
-        end_idx = start_idx + PAGE_SIZE
+        start_idx = (page - 1) * PAGE_SIZE_GRID
+        end_idx = start_idx + PAGE_SIZE_GRID
         page_accounts = accounts[start_idx:end_idx]
 
-        lines = [f"📂 Accounts (page {page}/{total_pages}):", ""]
+        text = f"📂 Accounts (page {page}/{total_pages}):"
         btn_rows = []
-
-        for acc in page_accounts:
-            acc_id = acc["id"]
-            label = acc["label"] or f"Account {acc_id}"
-            cg = acc["created_groups_count"] or 0
-            active = "✅" if acc["is_active"] else "❌"
-            proxy = "🌐" if acc["proxy_host"] else "🚫"
-            lines.append(
-                f"ID {acc_id}: {label} | Groups: {cg} | Active: {active} | Proxy: {proxy}"
-            )
-            btn_rows.append(
-                [
-                    Button.inline(
-                        f"Toggle {acc_id}",
-                        data=f"accounts:toggle:{acc_id}:{page}".encode(),
-                    ),
-                    Button.inline(
-                        f"Proxy {acc_id}",
-                        data=f"accounts:proxy:{acc_id}:{page}".encode(),
-                    ),
-                ]
-            )
-
-
-        # Add account button
-        btn_rows.append([Button.inline("➕ Add Account", data=b"accounts:add")])
+        
+        # Create 5 rows of 2 columns
+        for i in range(0, len(page_accounts), 2):
+            row = []
+            for acc in page_accounts[i:i+2]:
+                acc_id = acc["id"]
+                label = acc["label"] or f"Acc {acc_id}"
+                status_emoji = "🟢" if acc["is_active"] else "🔴"
+                row.append(Button.inline(f"{status_emoji} {label}", data=f"accounts:view:{acc_id}:{page}"))
+            btn_rows.append(row)
 
         # Pagination buttons
         nav_buttons = []
         if page > 1:
-            nav_buttons.append(
-                Button.inline(
-                    "◀️ Prev", data=f"menu:accounts:{page-1}".encode()
-                )
-            )
+            nav_buttons.append(Button.inline("◀️ Prev", data=f"menu:accounts:{page-1}"))
         if page < total_pages:
-            nav_buttons.append(
-                Button.inline(
-                    "Next ▶️", data=f"menu:accounts:{page+1}".encode()
-                )
-            )
+            nav_buttons.append(Button.inline("Next ▶️", data=f"menu:accounts:{page+1}"))
         if nav_buttons:
             btn_rows.append(nav_buttons)
 
-        # Back button
-        btn_rows.append([Button.inline("⬅️ Back", data=b"menu:back")])
-
-        await event.edit("\n".join(lines), buttons=btn_rows)
+        if event.is_callback:
+            await event.edit(text, buttons=btn_rows)
+        else:
+            await event.respond(text, buttons=btn_rows)
 
     @bot.on(events.NewMessage(pattern="/start"))
     async def start_handler(event):
-        if event.sender_id != ADMIN_ID:
+        if event.sender_id not in ADMIN_IDS:
             await event.reply("Access denied.")
             return
-
         await show_main_menu(event)
 
     async def show_main_menu(event):
         text = "🛠 Admin Panel\nChoose an action:"
         buttons = [
-            [
-                Button.inline("📂 Accounts", data=b"menu:accounts"),
-                Button.inline("📊 Global Stats", data=b"menu:stats"),
-            ],
-            [
-                Button.inline("⚠️ Errors", data=b"menu:errors"),
-                Button.inline("⏱ Scheduler", data=b"menu:scheduler"),
-            ],
+            ["📂 Accounts", "📊 Stats"],
+            ["⚠️ Errors", "⏱ Scheduler"],
+            ["➕ Add Account"]
         ]
         await event.respond(text, buttons=buttons)
 
-    @bot.on(events.CallbackQuery(pattern=b"menu:accounts"))
-    async def cb_menu_accounts(event):
-        if event.sender_id != ADMIN_ID:
-            await event.answer("Access denied.", alert=True)
-            return
-
-        # always open page 1
+    @bot.on(events.NewMessage(func=lambda e: e.text == "📂 Accounts"))
+    async def msg_accounts(event):
+        if event.sender_id not in ADMIN_IDS: return
         await show_accounts_page(event, page=1)
 
-    @bot.on(events.CallbackQuery(pattern=re.compile(br"menu:accounts:(\d+)")))
-    async def cb_menu_accounts_page(event):
-        if event.sender_id != ADMIN_ID:
-            await event.answer("Access denied.", alert=True)
-            return
-
-        m = re.match(br"menu:accounts:(\d+)", event.data)
-        if not m:
-            await event.answer("Invalid page.", alert=True)
-            return
-
-        page = int(m.group(1))
-        await show_accounts_page(event, page=page)
-
-    @bot.on(events.CallbackQuery(pattern=b"menu:stats"))
-    async def cb_menu_stats(event):
-        if event.sender_id != ADMIN_ID:
-            await event.answer("Access denied.", alert=True)
-            return
-
+    @bot.on(events.NewMessage(func=lambda e: e.text == "📊 Stats"))
+    async def msg_stats(event):
+        if event.sender_id not in ADMIN_IDS: return
         stats = await get_global_stats()
         text_lines = [
             "📊 Global Stats",
             f"Total accounts: {stats['total_accounts']}",
             f"Active accounts: {stats['active_accounts']}",
             f"Total groups created (all accounts): {stats['total_groups']}",
-            "",
-            "Per-account:",
         ]
-        for acc in stats["accounts"]:
-            active = "✅" if acc["is_active"] else "❌"
-            proxy = "🌐" if acc["proxy_host"] else "🚫"
-            text_lines.append(
-                f"ID {acc['id']}: {acc['label']} | Groups: {acc['created_groups_count']} | {active} | {proxy}"
-            )
+        await event.respond("\n".join(text_lines))
 
-        buttons = [[Button.inline("⬅️ Back", data=b"menu:back")]]
-        await event.edit("\n".join(text_lines), buttons=buttons)
-
-    @bot.on(events.CallbackQuery(pattern=b"menu:errors"))
-    async def cb_menu_errors(event):
-        if event.sender_id != ADMIN_ID:
-            await event.answer("Access denied.", alert=True)
-            return
-
+    @bot.on(events.NewMessage(func=lambda e: e.text == "⚠️ Errors"))
+    async def msg_errors(event):
+        if event.sender_id not in ADMIN_IDS: return
         errors = await get_latest_errors(10)
         if not errors:
             text = "No errors logged yet."
@@ -198,16 +140,11 @@ def setup_admin_handlers(bot):
                     f"[{created_at}] Account={acc_id} | {context}\n{snippet}\n"
                 )
             text = "\n".join(lines)
+        await event.respond(text)
 
-        buttons = [[Button.inline("⬅️ Back", data=b"menu:back")]]
-        await event.edit(text, buttons=buttons)
-
-    @bot.on(events.CallbackQuery(pattern=b"menu:scheduler"))
-    async def cb_menu_scheduler(event):
-        if event.sender_id != ADMIN_ID:
-            await event.answer("Access denied.", alert=True)
-            return
-
+    @bot.on(events.NewMessage(func=lambda e: e.text == "⏱ Scheduler"))
+    async def msg_scheduler(event):
+        if event.sender_id not in ADMIN_IDS: return
         running = is_scheduler_running()
         status = "🟢 Running" if running else "🔴 Stopped"
         text = f"⏱ Scheduler Status: {status}"
@@ -215,176 +152,216 @@ def setup_admin_handlers(bot):
             [
                 Button.inline("▶️ Start", data=b"scheduler:start"),
                 Button.inline("⏹ Stop", data=b"scheduler:stop"),
-            ],
-            [Button.inline("⬅️ Back", data=b"menu:back")],
+            ]
         ]
+        await event.respond(text, buttons=buttons)
 
-        try:
-            await event.edit(text, buttons=buttons)
-        except MessageNotModifiedError:
-            # Message content & buttons are the same as before → ignore
-            pass
+    @bot.on(events.NewMessage(func=lambda e: e.text == "➕ Add Account"))
+    async def msg_add_account(event):
+        if event.sender_id not in ADMIN_IDS: return
+        ADMIN_STATE[event.sender_id] = {"mode": "add_account_phone"}
+        await event.respond("Please enter the phone number (including country code, e.g., +989123456789):")
 
-    @bot.on(events.CallbackQuery(pattern=b"menu:back"))
-    async def cb_menu_back(event):
-        if event.sender_id != ADMIN_ID:
-            await event.answer("Access denied.", alert=True)
+    @bot.on(events.CallbackQuery(pattern=re.compile(br"menu:accounts:(\d+)")))
+    async def cb_menu_accounts_page(event):
+        if event.sender_id not in ADMIN_IDS: return
+        page = int(event.pattern_match.group(1))
+        await show_accounts_page(event, page=page)
+
+    @bot.on(events.CallbackQuery(pattern=re.compile(br"accounts:view:(\d+):(\d+)")))
+    async def cb_account_view(event):
+        if event.sender_id not in ADMIN_IDS: return
+        acc_id = int(event.pattern_match.group(1))
+        page = int(event.pattern_match.group(2))
+        acc = await get_account_by_id(acc_id)
+        if not acc:
+            await event.answer("Account not found.", alert=True)
             return
-        # simulate /start
-        await event.delete()
-        fake = event
-        await start_handler(fake)
-
-    @bot.on(events.CallbackQuery(pattern=b"accounts:add"))
-    async def cb_accounts_add(event):
-        if event.sender_id != ADMIN_ID:
-            await event.answer("Access denied.", alert=True)
-            return
-
-        _ensure_sessions_dir()
-        ADMIN_STATE[event.sender_id] = {"mode": "adding_account_wait_file"}
+        
+        status = "Active 🟢" if acc["is_active"] else "Inactive 🔴"
         text = (
-            "➕ Add Account\n\n"
-            "Please send a session file (`.session`) for this account.\n"
-            "The file name will be used as the label (without extension)."
+            f"👤 Account: {acc['label']}\n"
+            f"ID: {acc_id}\n"
+            f"Status: {status}\n"
+            f"Groups Created: {acc['created_groups_count']}\n"
+            f"Proxy: {acc['proxy_host'] or 'None'}"
         )
-        await event.edit(text, buttons=[[Button.inline("⬅️ Back", data=b"menu:accounts")]])
-
-    @bot.on(events.NewMessage)
-    async def admin_message_handler(event):
-        # فقط ادمین
-        if event.sender_id != ADMIN_ID:
-            return
-
-        state = ADMIN_STATE.get(event.sender_id)
-        text = (event.raw_text or "").strip()
-
-        # حالت اضافه‌کردن اکانت (انتظار فایل سشن)
-        if state and state.get("mode") == "adding_account_wait_file":
-            if event.document:
-                file_name = event.file.name or "session.session"
-                if not file_name.endswith(".session"):
-                    await event.reply("File must be a .session file.")
-                    return
-
-                _ensure_sessions_dir()
-                path = os.path.join(SESSIONS_DIR, file_name)
-
-                await event.download_media(file=path)
-
-                label = os.path.splitext(file_name)[0]
-                await add_account(label=label, session_path=file_name)
-
-                ADMIN_STATE.pop(event.sender_id, None)
-                await event.reply(
-                    f"✅ Account added.\nLabel: {label}\nSession file: {file_name}"
-                )
-            else:
-                await event.reply("Please send a `.session` file.")
-            return
-
-        # حالت تنظیم پروکسی
-        if state and state.get("mode") == "setting_proxy":
-            account_id = state.get("account_id")
-
-            # پاک کردن پروکسی
-            if text.lower() == "none":
-                await update_proxy(account_id, None, None, None, None)
-                ADMIN_STATE.pop(event.sender_id, None)
-                await event.reply(f"✅ Proxy cleared for account {account_id}.")
-                return
-
-            # host:port یا host:port:username:password
-            parts = text.split(":")
-            if len(parts) not in (2, 4):
-                await event.reply(
-                    "Invalid format.\nUse `host:port` or `host:port:username:password`."
-                )
-                return
-
-            host = parts[0]
-            try:
-                port = int(parts[1])
-            except ValueError:
-                await event.reply("Port must be an integer.")
-                return
-
-            username = parts[2] if len(parts) == 4 else None
-            password = parts[3] if len(parts) == 4 else None
-
-            await update_proxy(account_id, host, port, username, password)
-            ADMIN_STATE.pop(event.sender_id, None)
-            await event.reply(f"✅ Proxy updated for account {account_id}.")
-            return
-
-        # اگر هیچ استیتی نبود، فعلاً پیام‌های معمولی رو نادیده می‌گیریم
-        # (می‌تونی اینجا help یا چیزی اضافه کنی اگر خواستی)
-        return
+        
+        buttons = [
+            [
+                Button.inline("Turn Off" if acc["is_active"] else "Turn On", data=f"accounts:toggle:{acc_id}:{page}"),
+                Button.inline("Set Proxy", data=f"accounts:proxy:{acc_id}:{page}")
+            ],
+            [
+                Button.inline("Delete Account", data=f"accounts:delete_confirm:{acc_id}:{page}"),
+                Button.inline("Send Session File", data=f"accounts:send_session:{acc_id}")
+            ],
+            [Button.inline("⬅️ Back to list", data=f"menu:accounts:{page}")]
+        ]
+        await event.edit(text, buttons=buttons)
 
     @bot.on(events.CallbackQuery(pattern=re.compile(br"accounts:toggle:(\d+):(\d+)")))
     async def cb_accounts_toggle(event):
-        if event.sender_id != ADMIN_ID:
-            await event.answer("Access denied.", alert=True)
-            return
-
-        m = re.match(br"accounts:toggle:(\d+):(\d+)", event.data)
-        if not m:
-            await event.answer("Invalid data.", alert=True)
-            return
-
-        acc_id = int(m.group(1))
-        page = int(m.group(2))
-
-        updated = await toggle_account_active(acc_id)
-        if not updated:
-            await event.answer("Account not found.", alert=True)
-            return
-
-        status = "Active" if updated["is_active"] else "Inactive"
-        await event.answer(f"Account {acc_id} is now {status}.", alert=True)
-
-        # بعد از Toggle همون صفحه‌ای که بودیم رو دوباره نشون بده
-        await show_accounts_page(event, page=page)
-
+        if event.sender_id not in ADMIN_IDS: return
+        acc_id = int(event.pattern_match.group(1))
+        page = int(event.pattern_match.group(2))
+        await toggle_account_active(acc_id)
+        await cb_account_view(event)
 
     @bot.on(events.CallbackQuery(pattern=re.compile(br"accounts:proxy:(\d+):(\d+)")))
     async def cb_accounts_proxy(event):
-        if event.sender_id != ADMIN_ID:
-            await event.answer("Access denied.", alert=True)
-            return
-
-        m = re.match(br"accounts:proxy:(\d+):(\d+)", event.data)
-        if not m:
-            await event.answer("Invalid data.", alert=True)
-            return
-
-        acc_id = int(m.group(1))
-        # page = int(m.group(2))  # اگر بعداً خواستی بعد از ست‌کردن پروکسی صفحه رو رفرش کنی، این به درد می‌خوره
-
+        if event.sender_id not in ADMIN_IDS: return
+        acc_id = int(event.pattern_match.group(1))
         ADMIN_STATE[event.sender_id] = {"mode": "setting_proxy", "account_id": acc_id}
-        text = (
-            f"🌐 Proxy settings for account {acc_id}\n\n"
-            "Send proxy in one of these formats:\n"
-            "`host:port`\n"
-            "`host:port:username:password`\n\n"
-            "To clear proxy, send `none`."
+        await event.respond(
+            f"🌐 Proxy for account {acc_id}\n"
+            "Format: `host:port` or `host:port:user:pass`\n"
+            "Send `none` to clear."
         )
-        await event.reply(text)
+
+    @bot.on(events.CallbackQuery(pattern=re.compile(br"accounts:delete_confirm:(\d+):(\d+)")))
+    async def cb_delete_confirm(event):
+        if event.sender_id not in ADMIN_IDS: return
+        acc_id = int(event.pattern_match.group(1))
+        page = int(event.pattern_match.group(2))
+        buttons = [
+            [Button.inline("✅ Yes, Delete", data=f"accounts:delete:{acc_id}:{page}")],
+            [Button.inline("❌ No, Cancel", data=f"accounts:view:{acc_id}:{page}")]
+        ]
+        await event.edit("Are you sure you want to delete this account?", buttons=buttons)
+
+    @bot.on(events.CallbackQuery(pattern=re.compile(br"accounts:delete:(\d+):(\d+)")))
+    async def cb_delete(event):
+        if event.sender_id not in ADMIN_IDS: return
+        acc_id = int(event.pattern_match.group(1))
+        page = int(event.pattern_match.group(2))
+        await delete_account(acc_id)
+        await event.answer("Account deleted.")
+        await show_accounts_page(event, page=page)
+
+    @bot.on(events.CallbackQuery(pattern=re.compile(br"accounts:send_session:(\d+)")))
+    async def cb_send_session(event):
+        if event.sender_id not in ADMIN_IDS: return
+        acc_id = int(event.pattern_match.group(1))
+        acc = await get_account_by_id(acc_id)
+        if acc:
+            path = os.path.join(SESSIONS_DIR, acc["session_path"])
+            if not path.endswith(".session"):
+                path += ".session"
+            if os.path.exists(path):
+                await event.respond(f"Session file for {acc['label']}:", file=path)
+            else:
+                await event.answer("File not found.", alert=True)
 
     @bot.on(events.CallbackQuery(pattern=b"scheduler:start"))
     async def cb_scheduler_start(event):
-        if event.sender_id != ADMIN_ID:
-            await event.answer("Access denied.", alert=True)
-            return
+        if event.sender_id not in ADMIN_IDS: return
         start_scheduler()
         await event.answer("Scheduler started.", alert=True)
-        await cb_menu_scheduler(event)
+        # Refresh scheduler msg
+        running = is_scheduler_running()
+        status = "🟢 Running" if running else "🔴 Stopped"
+        text = f"⏱ Scheduler Status: {status}"
+        buttons = [[Button.inline("▶️ Start", data=b"scheduler:start"), Button.inline("⏹ Stop", data=b"scheduler:stop")]]
+        await event.edit(text, buttons=buttons)
 
     @bot.on(events.CallbackQuery(pattern=b"scheduler:stop"))
     async def cb_scheduler_stop(event):
-        if event.sender_id != ADMIN_ID:
-            await event.answer("Access denied.", alert=True)
-            return
+        if event.sender_id not in ADMIN_IDS: return
         stop_scheduler()
         await event.answer("Scheduler stopped.", alert=True)
-        await cb_menu_scheduler(event)
+        # Refresh scheduler msg
+        running = is_scheduler_running()
+        status = "🟢 Running" if running else "🔴 Stopped"
+        text = f"⏱ Scheduler Status: {status}"
+        buttons = [[Button.inline("▶️ Start", data=b"scheduler:start"), Button.inline("⏹ Stop", data=b"scheduler:stop")]]
+        await event.edit(text, buttons=buttons)
+
+    @bot.on(events.NewMessage)
+    async def admin_message_handler(event):
+        if event.sender_id not in ADMIN_IDS: return
+        if not event.text: return
+        
+        state = ADMIN_STATE.get(event.sender_id)
+        if not state: return
+        
+        mode = state.get("mode")
+        text = event.text.strip()
+        
+        if mode == "add_account_phone":
+            phone = text
+            client = TelegramClient(os.path.join(SESSIONS_DIR, f"{phone}"), API_ID, API_HASH)
+            await client.connect()
+            try:
+                sent_code = await client.send_code_request(phone)
+                ADMIN_STATE[event.sender_id] = {
+                    "mode": "add_account_code",
+                    "phone": phone,
+                    "phone_code_hash": sent_code.phone_code_hash,
+                    "client": client
+                }
+                await event.respond(f"Code sent to {phone}. Please enter the code:")
+            except Exception as e:
+                await event.respond(f"Error: {e}")
+                await client.disconnect()
+                ADMIN_STATE.pop(event.sender_id)
+
+        elif mode == "add_account_code":
+            code = text
+            phone = state["phone"]
+            phone_code_hash = state["phone_code_hash"]
+            client = state["client"]
+            try:
+                await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
+                # Success
+                await add_account(label=phone, session_path=f"{phone}")
+                await event.respond(f"✅ Account {phone} added successfully!")
+                await client.disconnect()
+                ADMIN_STATE.pop(event.sender_id)
+            except SessionPasswordNeededError:
+                ADMIN_STATE[event.sender_id]["mode"] = "add_account_2fa"
+                await event.respond("Two-step verification enabled. Please enter your password:")
+            except PhoneCodeInvalidError:
+                await event.respond("Invalid code. Please try again:")
+            except Exception as e:
+                await event.respond(f"Error: {e}")
+                await client.disconnect()
+                ADMIN_STATE.pop(event.sender_id)
+
+        elif mode == "add_account_2fa":
+            password = text
+            client = state["client"]
+            try:
+                await client.sign_in(password=password)
+                phone = state["phone"]
+                await add_account(label=phone, session_path=f"{phone}")
+                await event.respond(f"✅ Account {phone} added successfully!")
+                await client.disconnect()
+                ADMIN_STATE.pop(event.sender_id)
+            except PasswordHashInvalidError:
+                await event.respond("Invalid password. Please try again:")
+            except Exception as e:
+                await event.respond(f"Error: {e}")
+                await client.disconnect()
+                ADMIN_STATE.pop(event.sender_id)
+
+        elif mode == "setting_proxy":
+            acc_id = state["account_id"]
+            if text.lower() == "none":
+                await update_proxy(acc_id, None, None, None, None)
+                await event.respond(f"✅ Proxy cleared for account {acc_id}.")
+            else:
+                parts = text.split(":")
+                if len(parts) in (2, 4):
+                    host = parts[0]
+                    try:
+                        port = int(parts[1])
+                        user = parts[2] if len(parts) == 4 else None
+                        pw = parts[3] if len(parts) == 4 else None
+                        await update_proxy(acc_id, host, port, user, pw)
+                        await event.respond(f"✅ Proxy updated for account {acc_id}.")
+                    except ValueError:
+                        await event.respond("Invalid port.")
+                else:
+                    await event.respond("Invalid format. Use `host:port` or `host:port:user:pass`.")
+            ADMIN_STATE.pop(event.sender_id)
