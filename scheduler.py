@@ -22,7 +22,7 @@ from db import (
     log_error,
     toggle_account_active,
 )
-from accounts import get_or_create_client, sync_accounts
+from accounts import get_or_create_client
 from utils import generate_group_title, generate_datetime_messages
 
 logger = logging.getLogger(__name__)
@@ -57,7 +57,6 @@ async def run_scheduler(bot_client):
                 continue
 
             accounts = await get_accounts(active_only=True)
-            await sync_accounts(accounts)
             now = datetime.utcnow()
 
             for index, acc in enumerate(accounts, start=1):
