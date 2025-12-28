@@ -100,9 +100,9 @@ def setup_admin_handlers(bot):
     async def show_main_menu(event):
         text = "🛠 Admin Panel\nChoose an action:"
         buttons = [
-            ["📂 Accounts", "📊 Stats"],
-            ["⚠️ Errors", "⏱ Scheduler"],
-            ["➕ Add Account"]
+            [Button.text("📂 Accounts"), Button.text("📊 Stats")],
+            [Button.text("⚠️ Errors"), Button.text("⏱ Scheduler")],
+            [Button.text("➕ Add Account")]
         ]
         await event.respond(text, buttons=buttons)
 
