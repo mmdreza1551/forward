@@ -6,12 +6,13 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from telethon import functions, types
+from telethon.errors.rpcerrorlist import ChannelsTooMuchError, FloodWaitError
 
 from config import (
     GROUP_INTERVAL_MINUTES,
     MAX_GROUPS_PER_ACCOUNT,
     MAX_ACCOUNT_DAYS,
-    ADMIN_ID,
+    ADMIN_IDS,
 )
 from db import (
     get_accounts,
@@ -19,8 +20,9 @@ from db import (
     increment_account_groups,
     update_account_activity,
     log_error,
+    toggle_account_active,
 )
-from accounts import get_or_create_client
+from accounts import get_or_create_client, sync_accounts
 from utils import generate_group_title, generate_datetime_messages
 
 logger = logging.getLogger(__name__)
@@ -55,9 +57,13 @@ async def run_scheduler(bot_client):
                 continue
 
             accounts = await get_accounts(active_only=True)
+            await sync_accounts(accounts)
             now = datetime.utcnow()
 
             for index, acc in enumerate(accounts, start=1):
+                if not SCHEDULER_RUNNING:
+                    break
+
                 account_id = acc["id"]
                 created_groups = acc["created_groups_count"] or 0
 
@@ -81,11 +87,9 @@ async def run_scheduler(bot_client):
                     if now - first_activity > timedelta(days=MAX_ACCOUNT_DAYS):
                         continue
 
-                # Check 30 minutes interval
+                # Check interval
                 if last_group:
-                    if now - last_group < timedelta(
-                        minutes=GROUP_INTERVAL_MINUTES
-                    ):
+                    if now - last_group < timedelta(minutes=GROUP_INTERVAL_MINUTES):
                         continue
 
                 # Eligible to create a group
@@ -145,6 +149,18 @@ async def run_scheduler(bot_client):
                         f"chat_id={chat_id}, messages_sent={sent_count}"
                     )
 
+                except ChannelsTooMuchError:
+                    logger.warning(f"Account {account_id} reached channel limit. Deactivating.")
+                    await toggle_account_active(account_id)
+                    await log_error("scheduler", "ChannelsTooMuchError", account_id)
+                    try:
+                        await bot_client.send_message(ADMIN_IDS[0], f"⚠️ Account {acc['label']} (ID {account_id}) reached channel limit and was deactivated.")
+                    except: pass
+
+                except FloodWaitError as e:
+                    logger.warning(f"Flood wait for {e.seconds}s on account {account_id}")
+                    await asyncio.sleep(e.seconds)
+
                 except Exception as e:
                     err_text = f"Scheduler error for account {account_id}: {e!r}"
                     logger.exception(err_text)
@@ -155,10 +171,11 @@ async def run_scheduler(bot_client):
                     )
                     # Notify admin via bot
                     try:
-                        await bot_client.send_message(
-                            ADMIN_ID,
-                            f"❌ Scheduler error\nAccount ID: {account_id}\nError: {e}",
-                        )
+                        for admin_id in ADMIN_IDS:
+                            await bot_client.send_message(
+                                admin_id,
+                                f"❌ Scheduler error\nAccount ID: {account_id}\nError: {e}",
+                            )
                     except Exception:
                         logger.exception("Failed to notify admin about scheduler error.")
 
