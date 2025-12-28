@@ -77,6 +77,50 @@ async def get_account_by_id(account_id: int) -> Optional[Dict[str, Any]]:
         return dict(row) if row else None
 
 
+async def delete_account(account_id: int) -> bool:
+    """Delete an account and all related data (groups, errors).
+    
+    Args:
+        account_id: The ID of the account to delete
+        
+    Returns:
+        True if account was deleted, False if not found
+    """
+    import os
+    
+    # Get account info first
+    account = await get_account_by_id(account_id)
+    if not account:
+        return False
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Delete related groups
+        await db.execute("DELETE FROM groups WHERE account_id = ?", (account_id,))
+        
+        # Delete related errors
+        await db.execute("DELETE FROM errors WHERE account_id = ?", (account_id,))
+        
+        # Delete the account itself
+        await db.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
+        
+        await db.commit()
+    
+    # Try to delete session file
+    try:
+        from config import SESSIONS_DIR
+        session_path = account.get("session_path", "")
+        if session_path:
+            full_path = os.path.join(SESSIONS_DIR, session_path)
+            if not full_path.endswith(".session"):
+                full_path += ".session"
+            if os.path.exists(full_path):
+                os.remove(full_path)
+    except Exception:
+        pass  # Ignore session file deletion errors
+    
+    return True
+
+
 async def toggle_account_active(account_id: int) -> Optional[Dict[str, Any]]:
     account = await get_account_by_id(account_id)
     if not account:
